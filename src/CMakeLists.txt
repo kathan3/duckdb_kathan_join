@@ -60,15 +60,15 @@ endfunction()
 if(AMALGAMATION_BUILD)
 
   add_library(duckdb SHARED "${PROJECT_SOURCE_DIR}/src/amalgamation/duckdb.cpp")
-  target_link_libraries(duckdb ${DUCKDB_SYSTEM_LIBS})
+  target_link_libraries(duckdb PUBLIC ${DUCKDB_SYSTEM_LIBS} Threads::Threads)
   link_threads(duckdb)
-  link_extension_libraries(duckdb)
+  link_extension_libraries(duckdb PUBLIC)
 
   add_library(duckdb_static STATIC
               "${PROJECT_SOURCE_DIR}/src/amalgamation/duckdb.cpp")
-  target_link_libraries(duckdb_static ${DUCKDB_SYSTEM_LIBS})
+  target_link_libraries(duckdb_static PUBLIC ${DUCKDB_SYSTEM_LIBS} Threads::Threads)
   link_threads(duckdb_static)
-  link_extension_libraries(duckdb_static)
+  link_extension_libraries(duckdb_static PUBLIC)
 
   install(FILES "${PROJECT_SOURCE_DIR}/src/amalgamation/duckdb.hpp"
                 "${PROJECT_SOURCE_DIR}/src/include/duckdb.h"
@@ -130,12 +130,13 @@ else()
     target_sources(duckdb PRIVATE version.rc)
   endif()
 
-  target_link_libraries(duckdb ${DUCKDB_LINK_LIBS})
+  target_link_libraries(duckdb PUBLIC ${DUCKDB_LINK_LIBS} warpcore Threads::Threads)
   link_threads(duckdb)
   link_extension_libraries(duckdb)
 
   add_library(duckdb_static STATIC ${ALL_OBJECT_FILES})
-  target_link_libraries(duckdb_static ${DUCKDB_LINK_LIBS})
+
+  target_link_libraries(duckdb_static PUBLIC ${DUCKDB_LINK_LIBS} warpcore Threads::Threads)
   link_threads(duckdb_static)
   link_extension_libraries(duckdb_static)
 
@@ -160,7 +161,7 @@ else()
 endif()
 
 install(
-  TARGETS duckdb duckdb_static
+  TARGETS duckdb duckdb_static warpcore helpers kiss_rng
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"

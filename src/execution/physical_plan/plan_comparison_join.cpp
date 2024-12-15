@@ -77,7 +77,7 @@ unique_ptr<PhysicalOperator> PhysicalPlanGenerator::PlanComparisonJoin(LogicalCo
 	    //Define some simple c//ost estimation functions:
 		auto EstimateHashJoinCost = [&](idx_t left_card, idx_t right_card) {
 			// For demo: hash join cost ~ sum of sizes
-			return (double)left_card + (double)right_card;
+			return 1000;
 		};
 		auto EstimateIEJoinCost = [&](idx_t left_card, idx_t right_card) {
 			// For demo: IEJoin cost ~ left_card * log(right_card)

@@ -12,8 +12,16 @@ set(SHELL_SOURCES ${SHELL_SOURCES} shell.cpp shell_renderer.cpp
 option(STATIC_LIBCPP "Statically link CLI to libc++" FALSE)
 
 add_executable(shell ${SHELL_SOURCES})
-target_link_libraries(shell sqlite3_api_wrapper_static
-                      ${DUCKDB_EXTRA_LINK_FLAGS})
+# target_link_libraries(shell sqlite3_api_wrapper_static PUBLIC
+#                       ${DUCKDB_EXTRA_LINK_FLAGS})
+
+# Link against sqlite3_api_wrapper_static with PUBLIC visibility
+target_link_libraries(shell PUBLIC sqlite3_api_wrapper_static)
+
+# Apply extra linker flags using target_link_options
+target_link_options(shell PUBLIC ${DUCKDB_EXTRA_LINK_FLAGS})
+
+
 link_threads(shell)
 if(STATIC_LIBCPP)
   message("Statically linking CLI")
@@ -21,7 +29,7 @@ if(STATIC_LIBCPP)
 endif()
 
 if(NOT AMALGAMATION_BUILD AND NOT WIN32)
-  target_link_libraries(shell duckdb_utf8proc)
+  target_link_libraries(shell PUBLIC duckdb_utf8proc)
 endif()
 
 function(ensure_variable_is_number INPUT_VERSION OUT_RESULT)

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.5...3.29)
 
+# Include CPM.cmake for dependency management
+include(cmake/CPM.cmake)
+
 if(NOT CLANG_TIDY)
   find_package(Python3)
 endif()
@@ -20,18 +23,59 @@ if(POLICY CMP0063)
   cmake_policy(SET CMP0063 NEW)
 endif()
 
-project(DuckDB)
+set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce") #I've changed this from 11 to 17
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Enable CUDA language
+enable_language(CUDA)
+
+# Set CUDA to use C++17
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+project(DuckDB LANGUAGES C CXX CUDA)
 
 find_package(Threads REQUIRED)
+
+# Find the CUDA Toolkit package
+find_package(CUDAToolkit REQUIRED)
+
+# Locate the CUDA runtime library (cudart)
+find_library(CUDART_LIBRARY 
+    NAMES libcudart.so
+    PATHS /usr/lib/x86_64-linux-gnu
+    NO_DEFAULT_PATH
+)
+if (NOT CUDART_LIBRARY)
+    message(FATAL_ERROR "Failed to find the CUDA runtime library (libcudart.so). Ensure the library exists at the specified path.")
+else()
+    message(STATUS "CUDA runtime library found: ${CUDART_LIBRARY}")
+endif()
+
+# Add Warpcore using CPM
+CPMAddPackage(
+    NAME warpcore
+    GITHUB_REPOSITORY sleeepyjack/warpcore
+    GIT_TAG 1.0.0-alpha.1  # Ensure this tag exists; update if necessary
+)
+
+# Verify Warpcore was added successfully
+if(NOT warpcore_ADDED)
+    message(FATAL_ERROR "Failed to add Warpcore via CPM")
+endif()
+
+
+# Set CUDA properties for Warpcore
+set_target_properties(warpcore PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "61"  # Replace "61" with your GPU's architecture code
+)
 
 set(DUCKDB_MODULE_BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(CMAKE_CXX_STANDARD "11" CACHE STRING "C++ standard to enforce")
-
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_VERBOSE_MAKEFILE OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -769,19 +813,30 @@ function(get_statically_linked_extensions DUCKDB_EXTENSION_NAMES OUT_VARIABLE)
   endif()
 endfunction()
 
+# function(link_extension_libraries LIBRARY)
+#   get_statically_linked_extensions("${DUCKDB_EXTENSION_NAMES}" STATICALLY_LINKED_EXTENSIONS)
+#   # Now link against any registered out-of-tree extensions
+#   foreach(EXT_NAME IN LISTS STATICALLY_LINKED_EXTENSIONS)
+#     string(TOUPPER ${EXT_NAME} EXT_NAME_UPPERCASE)
+#     if (${DUCKDB_EXTENSION_${EXT_NAME_UPPERCASE}_SHOULD_LINK})
+#       target_link_libraries(${LIBRARY} ${EXT_NAME}_extension)
+#     endif()
+#   endforeach()
+# endfunction()
+
 function(link_extension_libraries LIBRARY)
   get_statically_linked_extensions("${DUCKDB_EXTENSION_NAMES}" STATICALLY_LINKED_EXTENSIONS)
-  # Now link against any registered out-of-tree extensions
   foreach(EXT_NAME IN LISTS STATICALLY_LINKED_EXTENSIONS)
     string(TOUPPER ${EXT_NAME} EXT_NAME_UPPERCASE)
     if (${DUCKDB_EXTENSION_${EXT_NAME_UPPERCASE}_SHOULD_LINK})
-      target_link_libraries(${LIBRARY} ${EXT_NAME}_extension)
+      target_link_libraries(${LIBRARY} PUBLIC ${EXT_NAME}_extension)
     endif()
   endforeach()
 endfunction()
 
+
 function(link_threads LIBRARY)
-    target_link_libraries(${LIBRARY} Threads::Threads)
+    target_link_libraries(${LIBRARY} PUBLIC Threads::Threads)
 endfunction()
 
 # Deploys extensions to a local repository (a folder structure that contains the duckdb version + binary arch)
