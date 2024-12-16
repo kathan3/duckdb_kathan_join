@@ -6,169 +6,329 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/execution/operator/join/physical_kathan_join.hpp"
-#include "duckdb/execution/join_hashtable.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/execution_context.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
+
 #include <warpcore/single_value_hash_table.cuh>
 #include <cuda_runtime.h>
+#include <cstdio>
 
 namespace duckdb {
 
-using namespace warpcore;
-
-// Define the hash table type
 using key_t = uint32_t;
 using value_t = uint32_t;
-using hash_table_t = SingleValueHashTable<key_t, value_t>;
+using hash_table_t = warpcore::SingleValueHashTable<key_t, value_t>;
 
-struct KathanJoinGlobalState : public GlobalSinkState {
+//===--------------------------------------------------------------------===//
+// Sink States (build side only)
+//===--------------------------------------------------------------------===//
+struct PhysicalKathanJoinGlobalSinkState : public GlobalSinkState {
+    virtual ~PhysicalKathanJoinGlobalSinkState() {}
+
+    // Build side rows
+    std::vector<std::vector<Value>> build_rows;
+    idx_t build_size = 0;
+
+    // GPU hash table
+    key_t *d_keys = nullptr;
+    value_t *d_vals = nullptr;
     unique_ptr<hash_table_t> hash_table;
+    bool finalized = false;
+};
 
-    KathanJoinGlobalState(idx_t capacity) {
-        hash_table = make_uniq<hash_table_t>(capacity);
+struct PhysicalKathanJoinLocalSinkState : public LocalSinkState {
+    virtual ~PhysicalKathanJoinLocalSinkState() {}
+
+    // Local build rows
+    std::vector<std::vector<Value>> local_build_rows;
+};
+
+//===--------------------------------------------------------------------===//
+// Source States (probe side handled via Source phase)
+//===--------------------------------------------------------------------===//
+struct PhysicalKathanJoinGlobalSourceState : public GlobalSourceState {
+    virtual ~PhysicalKathanJoinGlobalSourceState() {}
+    bool done = false; // Indicates if all probe data has been processed
+};
+
+struct PhysicalKathanJoinLocalSourceState : public LocalSourceState {
+    virtual ~PhysicalKathanJoinLocalSourceState() {}
+    key_t *d_probe_keys = nullptr;
+    value_t *d_probe_results = nullptr;
+};
+
+//===--------------------------------------------------------------------===//
+// Constructor
+//===--------------------------------------------------------------------===//
+PhysicalKathanJoin::PhysicalKathanJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left,
+                                     unique_ptr<PhysicalOperator> right, vector<JoinCondition> cond,
+                                     JoinType join_type, idx_t estimated_cardinality)
+    : PhysicalComparisonJoin(op, PhysicalOperatorType::KATHAN_JOIN, std::move(cond), join_type, estimated_cardinality) {
+
+    printf("PhysicalKathanJoin: Constructor called.\n");
+    children.push_back(std::move(left));
+    children.push_back(std::move(right));
+
+    for (auto &c : conditions) {
+        condition_types.push_back(c.left->return_type);
     }
-};
 
-struct KathanJoinLocalState : public LocalSinkState {
-    DataChunk join_keys;
-    DataChunk payload;
-};
+    // Build side (right child)
+    auto &build_types = children[1]->GetTypes();
+    for (idx_t i = 0; i < build_types.size(); i++) {
+        build_payload_col_idx.push_back(i);
+        build_payload_types.push_back(build_types[i]);
+    }
 
+    // Initialize probe output column indices (probe side columns first)
+    for (idx_t i = 0; i < children[0]->GetTypes().size(); i++) {
+        probe_output_col_idx.push_back(i);
+        probe_output_types.push_back(children[0]->GetTypes()[i]);
+    }
+
+    // Add build columns after probe columns for output
+    for (auto &btype : build_payload_types) {
+        probe_output_types.push_back(btype);
+    }
+
+    printf("PhysicalKathanJoin: Initialized successfully.\n");
+}
+
+//===--------------------------------------------------------------------===//
+// ParamsToString
+//===--------------------------------------------------------------------===//
+InsertionOrderPreservingMap<string> PhysicalKathanJoin::ParamsToString() const {
+    InsertionOrderPreservingMap<string> result;
+    result["Join Type"] = EnumUtil::ToString(join_type);
+    string condition_info;
+    for (idx_t i = 0; i < conditions.size(); i++) {
+        if (i > 0) {
+            condition_info += "\n";
+        }
+        auto &cond = conditions[i];
+        condition_info += cond.left->GetName() + " " +
+                          ExpressionTypeToString(cond.comparison) + " " +
+                          cond.right->GetName();
+    }
+    result["Conditions"] = condition_info;
+    SetEstimatedCardinality(result, estimated_cardinality);
+    return result;
+}
+
+//===--------------------------------------------------------------------===//
+// Sink (Build Phase)
+//===--------------------------------------------------------------------===//
 unique_ptr<GlobalSinkState> PhysicalKathanJoin::GetGlobalSinkState(ClientContext &context) const {
-    idx_t capacity = 1024; // Define an appropriate capacity based on the workload
-    printf("GetGlobalSinkState: Initializing hash table with capacity = %zu\n", capacity);
-    return make_uniq<KathanJoinGlobalState>(capacity);
+    printf("GetGlobalSinkState called.\n");
+    return make_uniq<PhysicalKathanJoinGlobalSinkState>();
 }
 
 unique_ptr<LocalSinkState> PhysicalKathanJoin::GetLocalSinkState(ExecutionContext &context) const {
-    auto state = make_uniq<KathanJoinLocalState>();
-    state->join_keys.Initialize(Allocator::DefaultAllocator(), condition_types);
-    state->payload.Initialize(Allocator::DefaultAllocator(), lhs_output_types);
-
-    // Log initialization details
-    printf("GetLocalSinkState: Initialized join_keys with %zu columns.\n", state->join_keys.ColumnCount());
-    printf("GetLocalSinkState: Initialized payload with %zu columns.\n", state->payload.ColumnCount());
-
-    return std::move(state);
+    printf("GetLocalSinkState called.\n");
+    return make_uniq<PhysicalKathanJoinLocalSinkState>();
 }
 
 SinkResultType PhysicalKathanJoin::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
-    auto &gstate = input.global_state.Cast<KathanJoinGlobalState>();
-    auto &lstate = input.local_state.Cast<KathanJoinLocalState>();
+    auto &gstate = input.global_state.Cast<PhysicalKathanJoinGlobalSinkState>();
+    auto &lstate = input.local_state.Cast<PhysicalKathanJoinLocalSinkState>();
 
-    // Debug: Log chunk details
-    printf("Sink: Received chunk with %zu rows and %zu columns.\n", chunk.size(), chunk.ColumnCount());
-
-    if (chunk.size() == 0 || chunk.ColumnCount() == 0) {
-        throw InternalException("Sink received an empty chunk.");
-    }
-
-    // Reset join keys and payload
-    lstate.join_keys.Reset();
-    lstate.payload.Reset();
-
-    // Validate column count matches join condition
-    if (condition_types.size() != chunk.ColumnCount()) {
-        throw InternalException("Mismatch between condition types (%zu) and chunk columns (%zu).",
-                                condition_types.size(), chunk.ColumnCount());
-    }
-
-    // Populate join keys
-    for (idx_t col_idx = 0; col_idx < condition_types.size(); col_idx++) {
-        for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-            lstate.join_keys.data[col_idx].SetValue(row_idx, chunk.data[col_idx].GetValue(row_idx));
+    // Treat all incoming chunks as build side data
+    chunk.Flatten();
+    for (idx_t i = 0; i < chunk.size(); i++) {
+        std::vector<Value> row;
+        for (auto col_idx : build_payload_col_idx) {
+            row.emplace_back(chunk.GetValue(col_idx, i));
         }
+        lstate.local_build_rows.emplace_back(std::move(row));
     }
-
-    // Extract raw pointers for keys and payloads
-    auto keys_data = FlatVector::GetData<key_t>(lstate.join_keys.data[0]);
-    auto payload_data = FlatVector::GetData<value_t>(lstate.payload.data[0]);
-
-    // Insert into the hash table
-    try {
-        gstate.hash_table->insert(keys_data, payload_data, chunk.size());
-    } catch (std::exception &e) {
-        throw InternalException("Error inserting into hash table: %s", e.what());
-    }
-
-    printf("Sink: Inserted %zu rows into hash table.\n", chunk.size());
+    printf("Sink: Appended %zu build rows locally.\n", (size_t)chunk.size());
     return SinkResultType::NEED_MORE_INPUT;
 }
 
 SinkCombineResultType PhysicalKathanJoin::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
-    auto &gstate = input.global_state.Cast<KathanJoinGlobalState>();
-    auto &lstate = input.local_state.Cast<KathanJoinLocalState>();
+    auto &gstate = input.global_state.Cast<PhysicalKathanJoinGlobalSinkState>();
+    auto &lstate = input.local_state.Cast<PhysicalKathanJoinLocalSinkState>();
 
-    // No specific combine logic for now
+    // Combine build rows
+    for (auto &row : lstate.local_build_rows) {
+        gstate.build_rows.emplace_back(std::move(row));
+    }
+    lstate.local_build_rows.clear();
+
+    printf("Combine: Combined local build rows into global state.\n");
     return SinkCombineResultType::FINISHED;
 }
 
-SinkFinalizeType PhysicalKathanJoin::Finalize(Pipeline &pipeline, Event &event, ClientContext &context, OperatorSinkFinalizeInput &input) const {
-    auto &gstate = input.global_state.Cast<KathanJoinGlobalState>();
+SinkFinalizeType PhysicalKathanJoin::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+                                            OperatorSinkFinalizeInput &input) const {
+    auto &gstate = input.global_state.Cast<PhysicalKathanJoinGlobalSinkState>();
+    gstate.build_size = gstate.build_rows.size();
+    printf("Finalize: Total build side rows = %zu\n", (size_t)gstate.build_size);
 
-    printf("Finalize: Skipping hash table finalization as no Finalize method is provided.\n");
-
-    // Validate hash table state
-    if (!gstate.hash_table) {
-        throw InternalException("Hash table is not initialized.");
+    if (gstate.build_size == 0 && EmptyResultIfRHSIsEmpty()) {
+        printf("Finalize: Build side empty => empty result.\n");
+        return SinkFinalizeType::NO_OUTPUT_POSSIBLE;
     }
 
-    printf("Finalize: Hash table is ready for probing.\n");
+    // Build GPU hash table from build_rows
+    std::vector<key_t> h_keys;
+    std::vector<value_t> h_vals;
+    h_keys.reserve(gstate.build_size);
+    h_vals.reserve(gstate.build_size);
+
+    // Assume first column is the join key
+    for (idx_t i = 0; i < gstate.build_size; i++) {
+        auto &key_val = gstate.build_rows[i][0];
+        if (!key_val.IsNull()) {
+            uint32_t key_extracted = key_val.GetValue<uint32_t>();
+            h_keys.emplace_back(static_cast<key_t>(key_extracted));
+            h_vals.emplace_back(static_cast<value_t>(i));
+        }
+    }
+
+    gstate.build_size = h_keys.size();
+    if (gstate.build_size == 0 && EmptyResultIfRHSIsEmpty()) {
+        return SinkFinalizeType::NO_OUTPUT_POSSIBLE;
+    }
+
+    // Allocate GPU memory and copy build keys and values
+    cudaMalloc(&gstate.d_keys, sizeof(key_t) * gstate.build_size);
+    cudaMalloc(&gstate.d_vals, sizeof(value_t) * gstate.build_size);
+    cudaMemcpy(gstate.d_keys, h_keys.data(), sizeof(key_t) * gstate.build_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(gstate.d_vals, h_vals.data(), sizeof(value_t) * gstate.build_size, cudaMemcpyHostToDevice);
+
+    // Initialize and build the GPU hash table
+    float load_factor = 0.9f;
+    uint64_t capacity = static_cast<uint64_t>(gstate.build_size / load_factor);
+    gstate.hash_table = make_uniq<hash_table_t>(capacity);
+    gstate.hash_table->insert(gstate.d_keys, gstate.d_vals, gstate.build_size);
+    cudaDeviceSynchronize();
+
+    gstate.finalized = true;
+    printf("Finalize: GPU hash table built with %zu entries.\n", (size_t)gstate.build_size);
+
     return SinkFinalizeType::READY;
 }
 
-unique_ptr<OperatorState> PhysicalKathanJoin::GetOperatorState(ExecutionContext &context) const {
-    return make_uniq<OperatorState>();
+//===--------------------------------------------------------------------===//
+// Source (Probe Phase)
+//===--------------------------------------------------------------------===//
+unique_ptr<GlobalSourceState> PhysicalKathanJoin::GetGlobalSourceState(ClientContext &context) const {
+    return make_uniq<PhysicalKathanJoinGlobalSourceState>();
 }
 
-OperatorResultType PhysicalKathanJoin::ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk, GlobalOperatorState &gstate, OperatorState &state) const {
-    auto &global_state = sink_state->Cast<KathanJoinGlobalState>();
+unique_ptr<LocalSourceState> PhysicalKathanJoin::GetLocalSourceState(ExecutionContext &context,
+                                                                     GlobalSourceState &gstate) const {
+    return make_uniq<PhysicalKathanJoinLocalSourceState>();
+}
 
-    // Debug: Log input details
-    printf("ExecuteInternal: Input chunk has %zu rows and %zu columns.\n", input.size(), input.ColumnCount());
+SourceResultType PhysicalKathanJoin::GetData(ExecutionContext &context, DataChunk &chunk,
+                                           OperatorSourceInput &input) const {
+    auto &gsource = input.global_state.Cast<PhysicalKathanJoinGlobalSourceState>();
+    auto &lsource = input.local_state.Cast<PhysicalKathanJoinLocalSourceState>();
+    auto &gsink = sink_state->Cast<PhysicalKathanJoinGlobalSinkState>();
 
-    if (input.size() == 0 || input.ColumnCount() == 0) {
-        throw InternalException("ExecuteInternal received an empty input chunk.");
+    // Ensure hash table is finalized
+    if (!gsink.finalized) {
+        // Hash table not ready yet
+        return SourceResultType::FINISHED;
     }
 
-    // Extract keys
-    auto keys_data = FlatVector::GetData<key_t>(input.data[0]);
-    auto chunk_size = input.size();
-
-    // Allocate result buffer
-    value_t *result_d = nullptr;
-    cudaMalloc(&result_d, sizeof(value_t) * chunk_size);
-
-    // Retrieve from hash table
-    try {
-        global_state.hash_table->retrieve(keys_data, chunk_size, result_d);
-    } catch (std::exception &e) {
-        cudaFree(result_d);
-        throw InternalException("Error retrieving from hash table: %s", e.what());
+    // Handle empty build side if required
+    if (gsink.build_size == 0 && EmptyResultIfRHSIsEmpty()) {
+        gsource.done = true;
+        return SourceResultType::FINISHED;
     }
 
-    // Copy results back to host
-    value_t *result_h = new value_t[chunk_size];
-    cudaMemcpy(result_h, result_d, sizeof(value_t) * chunk_size, cudaMemcpyDeviceToHost);
+    // If we've previously finished
+    if (gsource.done) {
+        return SourceResultType::FINISHED;
+    }
 
-    // Populate output chunk
-    chunk.Reset();
-    idx_t output_size = 0;
-    for (idx_t i = 0; i < chunk_size; ++i) {
-        if (result_h[i] != static_cast<value_t>(-1)) {
-            for (idx_t col_idx = 0; col_idx < input.ColumnCount(); ++col_idx) {
-                chunk.data[col_idx].SetValue(output_size, input.data[col_idx].GetValue(i));
-            }
-            output_size++;
+    // Fetch a probe chunk from the probe side (left child)
+    DataChunk probe_chunk;
+    probe_chunk.Initialize(Allocator::DefaultAllocator(), children[0]->GetTypes());
+
+    auto res = children[0]->GetData(context, probe_chunk, input);
+    if (res == SourceResultType::FINISHED) {
+        // No more probe data
+        gsource.done = true;
+        return SourceResultType::FINISHED;
+    }
+
+    if (probe_chunk.size() == 0) {
+        // Got an empty chunk, just return HAVE_MORE_OUTPUT and try again later
+        return SourceResultType::HAVE_MORE_OUTPUT;
+    }
+
+    // Now we have probe data, we can proceed
+    probe_chunk.Flatten();
+    idx_t probe_size = probe_chunk.size();
+    std::vector<key_t> h_probe_keys(probe_size);
+
+    for (idx_t i = 0; i < probe_size; i++) {
+        auto key_val = probe_chunk.GetValue(0, i).GetValue<uint32_t>();
+        h_probe_keys[i] = static_cast<key_t>(key_val);
+    }
+
+    // Allocate GPU buffers if needed
+    if (!lsource.d_probe_keys) {
+        cudaMalloc(&lsource.d_probe_keys, sizeof(key_t) * STANDARD_VECTOR_SIZE);
+        cudaMalloc(&lsource.d_probe_results, sizeof(value_t) * STANDARD_VECTOR_SIZE);
+    }
+
+    // Copy probe keys to GPU
+    cudaMemcpy(lsource.d_probe_keys, h_probe_keys.data(), sizeof(key_t) * probe_size, cudaMemcpyHostToDevice);
+
+    // Perform GPU hash table lookup
+    gsink.hash_table->retrieve(lsource.d_probe_keys, probe_size, lsource.d_probe_results);
+    cudaDeviceSynchronize();
+
+    // Retrieve results from GPU
+    std::vector<value_t> h_results(probe_size);
+    cudaMemcpy(h_results.data(), lsource.d_probe_results, sizeof(value_t) * probe_size, cudaMemcpyDeviceToHost);
+
+    // Initialize output chunk
+    chunk.Initialize(Allocator::DefaultAllocator(), probe_output_types);
+
+    // Join logic: produce matched rows
+    idx_t out_idx = 0;
+    idx_t probe_col_count = children[0]->GetTypes().size(); // Number of probe columns
+    idx_t build_col_count = build_payload_types.size();    // Number of build columns
+
+    for (idx_t i = 0; i < probe_size && out_idx < STANDARD_VECTOR_SIZE; i++) {
+        auto match_idx = h_results[i];
+        if (match_idx == static_cast<value_t>(-1)) {
+            // No match, skip
+            continue;
         }
+
+        // Set probe columns
+        for (idx_t col = 0; col < probe_col_count; col++) {
+            chunk.SetValue(col, out_idx, probe_chunk.GetValue(col, i));
+        }
+
+        // Set build columns
+        for (idx_t col = 0; col < build_col_count; col++) {
+            chunk.SetValue(probe_col_count + col, out_idx, gsink.build_rows[match_idx][build_payload_col_idx[col]]);
+        }
+
+        out_idx++;
     }
-    chunk.SetCardinality(output_size);
 
-    delete[] result_h;
-    cudaFree(result_d);
+    chunk.SetCardinality(out_idx);
 
-    return output_size > 0 ? OperatorResultType::HAVE_MORE_OUTPUT : OperatorResultType::FINISHED;
+    if (out_idx == 0) {
+        // No matches found in this batch, but maybe next batch has matches
+        return SourceResultType::HAVE_MORE_OUTPUT;
+    }
+
+    return SourceResultType::HAVE_MORE_OUTPUT;
 }
 
 } // namespace duckdb
