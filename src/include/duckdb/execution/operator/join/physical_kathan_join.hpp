@@ -1,10 +1,3 @@
-//===----------------------------------------------------------------------===//
-//                         DuckDB
-//
-// duckdb/execution/operator/join/physical_kathan_join.hpp
-//
-//===----------------------------------------------------------------------===//
-
 #pragma once
 
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
@@ -21,19 +14,23 @@ public:
                       unique_ptr<PhysicalOperator> right, vector<JoinCondition> cond,
                       JoinType join_type, idx_t estimated_cardinality);
 
-    // The join key types
+    // The join key and payload info
     vector<LogicalType> condition_types;
 
-    // Build side info (right child)
+    // Build side info
     vector<idx_t> build_payload_col_idx;
     vector<LogicalType> build_payload_types;
+
+    // Probe side info
+    vector<idx_t> probe_payload_col_idx;
+    vector<LogicalType> probe_payload_types;
 
     // Output columns: probe side columns first, then build side columns
     vector<idx_t> probe_output_col_idx;
     vector<LogicalType> probe_output_types;
 
 public:
-    // Sink interface (build phase)
+    // Sink interface
     unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
     unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
     SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
@@ -41,7 +38,7 @@ public:
     SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                               OperatorSinkFinalizeInput &input) const override;
 
-    // Source interface (probe phase)
+    // Source interface
     bool IsSink() const override {
         return true;
     }
@@ -62,10 +59,8 @@ public:
 protected:
     InsertionOrderPreservingMap<string> ParamsToString() const override;
     OperatorResultType ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-                                       GlobalOperatorState &gstate, OperatorState &state) const override {
-        // Not used here, but must provide an implementation.
-        return OperatorResultType::FINISHED;
-    }
+                                       GlobalOperatorState &gstate, OperatorState &state) const override;
+
 };
 
 } // namespace duckdb
