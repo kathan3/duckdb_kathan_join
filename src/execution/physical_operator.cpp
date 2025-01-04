@@ -299,29 +299,61 @@ CachingPhysicalOperator::CachingPhysicalOperator(PhysicalOperatorType type, vect
 OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                                     GlobalOperatorState &gstate, OperatorState &state_p) const {
 	auto &state = state_p.Cast<CachingOperatorState>();
-
+	// printf("State initialized: %d\n", state.initialized);
+	// printf("State can cache chunk: %d\n", state.can_cache_chunk);
+	// if (state.cached_chunk) {
+	// 	printf("Cached chunk size: %zu\n", state.cached_chunk->size());
+	// } else {
+	// 	printf("No cached chunk\n");
+	// }
+	// chunk.Print();
 	// Execute child operator
 	auto child_result = ExecuteInternal(context, input, chunk, gstate, state);
-
-#if STANDARD_VECTOR_SIZE >= 128
-	if (!state.initialized) {
-		state.initialized = true;
-		state.can_cache_chunk = caching_supported && PhysicalOperator::OperatorCachingAllowed(context);
-	}
-	if (!state.can_cache_chunk) {
-		return child_result;
-	}
-	// TODO chunk size of 0 should not result in a cache being created!
-	if (chunk.size() < CACHE_THRESHOLD) {
+	// chunk.Print();
+	#if STANDARD_VECTOR_SIZE >= 128
+		if (!state.initialized) {
+			state.initialized = true;
+			state.can_cache_chunk = caching_supported && PhysicalOperator::OperatorCachingAllowed(context);
+		}
+		// printf("Can cache chunk: %d\n", !state.can_cache_chunk);
+		if (!state.can_cache_chunk) {
+			return child_result;
+		}
+		// TODO chunk size of 0 should not result in a cache being created!
+		if (chunk.size() < CACHE_THRESHOLD) {
 		// we have filtered out a significant amount of tuples
 		// add this chunk to the cache and continue
 
+		
 		if (!state.cached_chunk) {
 			state.cached_chunk = make_uniq<DataChunk>();
-			state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
+			state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());	
+			// printf("hu ahiya 6u\n");
 		}
 
+		// compare with the "chunk" we are about to append
+		auto chunk_types = chunk.GetTypes();
+		// printf("DEBUG: chunk         => size=%zu, colcount=%zu\n",
+		// 	(size_t)chunk.size(), (size_t)chunk.ColumnCount());
+		// for (idx_t col_idx = 0; col_idx < chunk_types.size(); col_idx++) {
+		// 	printf("  chunk col[%zu]       = %s\n", (size_t)col_idx, chunk_types[col_idx].ToString().c_str());
+		// }
+		// chunk.Print();
+
+
+        // right before we do the append:
+		// auto cached_chunk_types = state.cached_chunk->GetTypes();
+		// printf("DEBUG: state.cached_chunk => size=%zu, colcount=%zu\n",
+		// 	(size_t)state.cached_chunk->size(),
+		// 	(size_t)state.cached_chunk->ColumnCount());
+		// for (idx_t col_idx = 0; col_idx < cached_chunk_types.size(); col_idx++) {
+		// 	printf("  cached_chunk col[%zu] = %s\n", (size_t)col_idx, cached_chunk_types[col_idx].ToString().c_str());
+		// }
+
+		// printf("Current chunk column count: %zu\n", chunk.ColumnCount());
+        // printf("State cached output count: %zu\n", state.cached_chunk->ColumnCount());
 		state.cached_chunk->Append(chunk);
+		// printf("Gotcha!\n");
 
 		if (state.cached_chunk->size() >= (STANDARD_VECTOR_SIZE - CACHE_THRESHOLD) ||
 		    child_result == OperatorResultType::FINISHED) {

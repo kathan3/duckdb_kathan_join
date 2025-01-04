@@ -77,7 +77,7 @@ unique_ptr<PhysicalOperator> PhysicalPlanGenerator::PlanComparisonJoin(LogicalCo
 	    //Define some simple c//ost estimation functions:
 		auto EstimateHashJoinCost = [&](idx_t left_card, idx_t right_card) {
 			// For demo: hash join cost ~ sum of sizes
-			return 1000;
+			return 0;
 		};
 		auto EstimateIEJoinCost = [&](idx_t left_card, idx_t right_card) {
 			// For demo: IEJoin cost ~ left_card * log(right_card)
@@ -98,7 +98,7 @@ unique_ptr<PhysicalOperator> PhysicalPlanGenerator::PlanComparisonJoin(LogicalCo
 		};
 		auto EstimateKathanJoinCost = [&](idx_t left_card, idx_t right_card) {
 			// KathanJoin: for testing, let's say it's 0.
-			return 0;
+			return 1000;
 		};
 
 		// Initialize costs to infinity
@@ -145,7 +145,9 @@ unique_ptr<PhysicalOperator> PhysicalPlanGenerator::PlanComparisonJoin(LogicalCo
 		// Create the chosen operator
 		if (min_cost == kathan_join_cost) {
 			// Use PhysicalKathanJoin
-			plan = make_uniq<PhysicalKathanJoin>(op, std::move(left), std::move(right), std::move(op.conditions), op.join_type, op.estimated_cardinality);
+			plan = make_uniq<PhysicalKathanJoin>(
+				op, std::move(left), std::move(right), std::move(op.conditions), op.join_type, op.left_projection_map,
+				op.right_projection_map, op.estimated_cardinality);
 		} else if (min_cost == hash_join_cost) {
 			// Hash Join
 			 plan = make_uniq<PhysicalHashJoin>(

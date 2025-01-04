@@ -199,7 +199,12 @@ void DataChunk::Append(const DataChunk &other, bool resize, SelectionVector *sel
 	if (other.size() == 0) {
 		return;
 	}
+
 	if (ColumnCount() != other.ColumnCount()) {
+		printf("Current chunk column count: %zu\n", ColumnCount());
+        printf("Other chunk column count: %zu\n", other.ColumnCount());
+		printf("Internal Error: Column counts of appending chunk don't match!\n");
+       
 		throw InternalException("Column counts of appending chunk doesn't match!");
 	}
 	if (new_size > capacity) {
