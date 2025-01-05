@@ -23,7 +23,7 @@ For more information on using DuckDB, please refer to the [DuckDB documentation]
 
 ## Installation
 
-If you want to install DuckDB, please see [our installation page](https://duckdb.org/docs/installation/) for instructions.
+If you want to install DuckDB, please see [our installation page](https://duckdb.org/docs/installation/) for instructions. If one wants to use cuda join then please change the cuda-architecture based on your GPU in the src/execution/operator/join/CMakeLists.txt
 
 ## Data Import
 
